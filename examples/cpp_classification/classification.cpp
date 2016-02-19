@@ -25,14 +25,14 @@ class Classifier {
              const string& mean_file,
              const string& label_file);
 
-  std::vector<Prediction> Classify(const cv::Mat& img, int N = 5);
+  std::vector<std::vector<Prediction> > Classify(const std::vector<cv::Mat>& imgs, int N = 5);
 
  private:
   void SetMean(const string& mean_file);
 
-  std::vector<float> Predict(const cv::Mat& img);
+  std::vector<std::vector<float> > Predict(const std::vector<cv::Mat>& imgs);
 
-  void WrapInputLayer(std::vector<cv::Mat>* input_channels);
+  void WrapInputLayer(std::vector<cv::Mat>* input_channels, int n);
 
   void Preprocess(const cv::Mat& img,
                   std::vector<cv::Mat>* input_channels);
@@ -102,18 +102,24 @@ static std::vector<int> Argmax(const std::vector<float>& v, int N) {
 }
 
 /* Return the top N predictions. */
-std::vector<Prediction> Classifier::Classify(const cv::Mat& img, int N) {
-  std::vector<float> output = Predict(img);
+std::vector<std::vector<Prediction> > Classifier::Classify(const std::vector<cv::Mat>& imgs, int N) {
+  std::vector<std::vector<float> > outputs = Predict(imgs);
 
-  N = std::min<int>(labels_.size(), N);
-  std::vector<int> maxN = Argmax(output, N);
-  std::vector<Prediction> predictions;
-  for (int i = 0; i < N; ++i) {
-    int idx = maxN[i];
-    predictions.push_back(std::make_pair(labels_[idx], output[idx]));
-  }
+  std::vector<std::vector<Prediction> > all_predictions;
+  for (int j = 0; j < outputs.size(); ++j) {
+    std::vector<float> output = outputs[j];
 
-  return predictions;
+    N = std::min<int>(labels_.size(), N);
+    std::vector<int> maxN = Argmax(output, N);
+    std::vector<Prediction> predictions;
+    for (int i = 0; i < N; ++i) {
+      int idx = maxN[i];
+      predictions.push_back(std::make_pair(labels_[idx], output[idx]));
+    }
+    all_predictions.push_back(predictions);
+ }
+
+  return all_predictions;
 }
 
 /* Load the mean file in binaryproto format. */
@@ -147,25 +153,30 @@ void Classifier::SetMean(const string& mean_file) {
   mean_ = cv::Mat(input_geometry_, mean.type(), channel_mean);
 }
 
-std::vector<float> Classifier::Predict(const cv::Mat& img) {
+std::vector<std::vector<float> > Classifier::Predict(const std::vector<cv::Mat>& imgs) {
   Blob<float>* input_layer = net_->input_blobs()[0];
-  input_layer->Reshape(1, num_channels_,
+  input_layer->Reshape(imgs.size(), num_channels_,
                        input_geometry_.height, input_geometry_.width);
   /* Forward dimension change to all layers. */
   net_->Reshape();
 
-  std::vector<cv::Mat> input_channels;
-  WrapInputLayer(&input_channels);
-
-  Preprocess(img, &input_channels);
-
+  for (int i = 0; i < imgs.size(); ++i) {
+      std::vector<cv::Mat> input_channels;
+      WrapInputLayer(&input_channels, i);
+      Preprocess(imgs[i], &input_channels);
+  }
   net_->ForwardPrefilled();
 
-  /* Copy the output layer to a std::vector */
+  std::vector<std::vector<float> > outputs;
+
   Blob<float>* output_layer = net_->output_blobs()[0];
-  const float* begin = output_layer->cpu_data();
-  const float* end = begin + output_layer->channels();
-  return std::vector<float>(begin, end);
+  for (int i = 0; i < output_layer->num(); ++i) {
+      const float* begin = output_layer->cpu_data() + i * output_layer->channels();
+      const float* end = begin + output_layer->channels();
+      /* Copy the output layer to a std::vector */
+      outputs.push_back(std::vector<float>(begin, end));
+  }
+  return outputs;
 }
 
 /* Wrap the input layer of the network in separate cv::Mat objects
@@ -173,16 +184,17 @@ std::vector<float> Classifier::Predict(const cv::Mat& img) {
  * don't need to rely on cudaMemcpy2D. The last preprocessing
  * operation will write the separate channels directly to the input
  * layer. */
-void Classifier::WrapInputLayer(std::vector<cv::Mat>* input_channels) {
+void Classifier::WrapInputLayer(std::vector<cv::Mat>* input_channels, int n) {
   Blob<float>* input_layer = net_->input_blobs()[0];
 
   int width = input_layer->width();
   int height = input_layer->height();
-  float* input_data = input_layer->mutable_cpu_data();
-  for (int i = 0; i < input_layer->channels(); ++i) {
-    cv::Mat channel(height, width, CV_32FC1, input_data);
-    input_channels->push_back(channel);
-    input_data += width * height;
+  int channels = input_layer->channels();
+  float* input_data = input_layer->mutable_cpu_data() + n * width * height * channels;
+  for (int i = 0; i < channels; ++i) {
+      cv::Mat channel(height, width, CV_32FC1, input_data);
+      input_channels->push_back(channel);
+      input_data += width * height;
   }
 }
 
@@ -221,13 +233,15 @@ void Classifier::Preprocess(const cv::Mat& img,
    * objects in input_channels. */
   cv::split(sample_normalized, *input_channels);
 
+/*
   CHECK(reinterpret_cast<float*>(input_channels->at(0).data)
         == net_->input_blobs()[0]->cpu_data())
     << "Input channels are not wrapping the input layer of the network.";
+*/
 }
 
 int main(int argc, char** argv) {
-  if (argc != 6) {
+  if (argc < 6) {
     std::cerr << "Usage: " << argv[0]
               << " deploy.prototxt network.caffemodel"
               << " mean.binaryproto labels.txt img.jpg" << std::endl;
@@ -242,20 +256,27 @@ int main(int argc, char** argv) {
   string label_file   = argv[4];
   Classifier classifier(model_file, trained_file, mean_file, label_file);
 
-  string file = argv[5];
-
-  std::cout << "---------- Prediction for "
-            << file << " ----------" << std::endl;
-
-  cv::Mat img = cv::imread(file, -1);
-  CHECK(!img.empty()) << "Unable to decode image " << file;
-  std::vector<Prediction> predictions = classifier.Classify(img);
+  std::vector<cv::Mat> imgs;
+  for (int i = 5; i < argc; ++i)
+  {
+      cv::Mat img = cv::imread(argv[i], -1);
+      CHECK(!img.empty()) << "Unable to decode image " << argv[i];
+      imgs.push_back(img);
+  }
+  std::vector<std::vector<Prediction> > all_predictions = classifier.Classify(imgs);
 
   /* Print the top N predictions. */
-  for (size_t i = 0; i < predictions.size(); ++i) {
-    Prediction p = predictions[i];
-    std::cout << std::fixed << std::setprecision(4) << p.second << " - \""
-              << p.first << "\"" << std::endl;
+  for (size_t i = 0; i < all_predictions.size(); ++i) {
+    std::cout << "---------- Prediction for "
+              << argv[5 + i] << " ----------" << std::endl;
+
+    std::vector<Prediction>& predictions = all_predictions[i];
+    for (size_t j = 0; j < predictions.size(); ++j) {
+        Prediction p = predictions[j];
+        std::cout << std::fixed << std::setprecision(4) << p.second << " - \""
+                  << p.first << "\"" << std::endl;
+    }
+    std::cout << std::endl;
   }
 }
 #else
